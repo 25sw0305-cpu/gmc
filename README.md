@@ -1,10 +1,6 @@
-# Meadow Voxels
+# Mineglo
 
-독립적으로 만든 브라우저용 싱글플레이 voxel 샌드박스입니다. Minecraft의 에셋이나 코드는 포함하지 않습니다.
-
-## 실행
-
-Node.js 20 이상에서 `npm install` 후 `npm run dev`를 실행합니다. 배포용 결과물은 `npm run build`로 생성합니다.
+독립적으로 만든 브라우저용 싱글플레이 voxel 샌드박스입니다.
 
 ## 조작
 
