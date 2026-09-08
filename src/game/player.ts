@@ -6,12 +6,16 @@ export class Player {
   readonly position = new THREE.Vector3(0, 30, 0);
   readonly velocity = new THREE.Vector3();
   yaw = 0; pitch = 0; grounded = false;
+  sensitivity = 1; // 설정 패널의 마우스 감도 슬라이더가 이 값을 갱신함
   private keys = new Set<string>();
   constructor(private readonly camera: THREE.PerspectiveCamera, private readonly world: VoxelWorld) {
     addEventListener('keydown', e => this.keys.add(e.code));
     addEventListener('keyup', e => this.keys.delete(e.code));
   }
-  look(dx: number, dy: number) { this.yaw -= dx * .0022; this.pitch = THREE.MathUtils.clamp(this.pitch - dy * .0022, -1.48, 1.48); }
+  look(dx: number, dy: number) {
+    const s = .0022 * this.sensitivity;
+    this.yaw -= dx * s; this.pitch = THREE.MathUtils.clamp(this.pitch - dy * s, -1.48, 1.48);
+  }
   update(dt: number) {
     const forward = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw));
     const right = new THREE.Vector3(forward.z, 0, -forward.x); const wish = new THREE.Vector3();
