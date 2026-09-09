@@ -1,0 +1,235 @@
+import * as THREE from 'three';
+import { BLOCKS, CHUNK, type BlockId, WORLD_HEIGHT } from './blocks';
+import { biomeAt, noise2, noise3, terrainHeight, type Biome } from './noise';
+
+const WATER_LEVEL = 15;
+const PAD = CHUNK + 2; // 청크 생성 시 이웃 블록 확인용 1칸 여백
+const BIOMES: Biome[] = ['plains', 'forest', 'desert', 'mountain'];
+
+type Face = number[];
+const FACES: Face[] = [
+  [0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0], [1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1],
+  [0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1], [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0],
+  [0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0], [0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]
+];
+const NEIGHBORS: [number, number, number][] = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]];
+
+export interface Hit { x: number; y: number; z: number; nx: number; ny: number; nz: number; }
+
+export class VoxelWorld {
+  readonly group = new THREE.Group();
+  readonly seed: number;
+  visibleRadius = 8;
+  chunksPerFrame = 3; // 프레임당 생성할 청크 수 제한 (한 번에 몰아서 만들면 프리징 발생)
+  private chunks = new Map<string, THREE.Group>();
+  private edits = new Map<string, BlockId>();
+  private materials = new Map<BlockId, THREE.MeshLambertMaterial>();
+  private buildQueue: [number, number][] = [];
+  private pending = new Set<string>();
+
+  constructor(seed = Math.floor(Math.random() * 1e9)) {
+    this.seed = seed;
+    this.group.name = 'voxel-world';
+    for (const block of Object.values(BLOCKS)) if (block.id) this.materials.set(block.id, new THREE.MeshLambertMaterial({
+      color: block.color, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .68 : 1,
+      side: block.id === 7 ? THREE.DoubleSide : THREE.FrontSide
+    }));
+    this.load();
+    localStorage.setItem('meadow-voxels-seed', String(this.seed));
+  }
+
+  get pendingChunks() { return this.buildQueue.length; }
+
+  private editKey(x: number, y: number, z: number) { return `${x},${y},${z}`; }
+  private chunkKey(cx: number, cz: number) { return `${cx},${cz}`; }
+
+  // 캐릭터가 있는 곳 근처의 동굴을 3D 노이즈로 지표면 아래에만 뚫음
+  private isCave(x: number, y: number, z: number, h: number): boolean {
+    if (y < 3 || y > h - 2) return false;
+    return noise3(x / 15, y / 11, z / 15, this.seed + 777) > 0.62;
+  }
+
+  // 깊이별 광맥: 석탄은 얕고 흔하게, 다이아몬드는 깊고 희귀하게
+  private oreAt(x: number, y: number, z: number): BlockId | null {
+    if (y > 40) return null;
+    const n = noise3(x / 6, y / 6, z / 6, this.seed + 321);
+    if (y < 10 && n > 0.905) return 11;
+    if (y < 24 && n > 0.87) return 10;
+    if (y < 34 && n > 0.82) return 9;
+    if (n > 0.78) return 8;
+    return null;
+  }
+
+  // biome/height를 이미 알고 있을 때 쓰는 빠른 버전 (청크 생성 시 컬럼당 1회만 계산해서 재사용)
+  private terrainWithCache(x: number, y: number, z: number, biome: Biome, h: number): BlockId {
+    if (y > h) return 0;
+    if (this.isCave(x, y, z, h)) return 0;
+    if (y === h) {
+      if (biome === 'desert') return 6;
+      if (biome === 'mountain' && h > 34) return 12;
+      return h < 17 ? 6 : 1;
+    }
+    if (y > h - 4) return biome === 'desert' ? 13 : 2;
+    if (y < 5 || noise2(x / 8, z / 8, this.seed + 91) > .77) return this.oreAt(x, y, z) ?? 3;
+    return 2;
+  }
+  private isTreeOrigin(x: number, z: number): boolean {
+    const biome = biomeAt(x, z, this.seed);
+    if (biome !== 'forest' && biome !== 'plains') return false;
+    const localX = ((x % CHUNK) + CHUNK) % CHUNK, localZ = ((z % CHUNK) + CHUNK) % CHUNK;
+    if (localX !== 2 && localX !== 8 && localX !== 14) return false;
+    if (localZ !== 2 && localZ !== 8 && localZ !== 14) return false;
+    const h = terrainHeight(x, z, this.seed, biome);
+    const threshold = biome === 'forest' ? 0.6 : 0.72;
+    return h >= 18 && noise2(x / 5, z / 5, this.seed + 45) >= threshold;
+  }
+
+  private treeBlock(x: number, y: number, z: number): BlockId {
+    for (let tz = z - 1; tz <= z + 1; tz++) for (let tx = x - 1; tx <= x + 1; tx++) {
+      if (!this.isTreeOrigin(tx, tz)) continue;
+      const h = terrainHeight(tx, tz, this.seed);
+      if (x === tx && z === tz && y >= h + 1 && y <= h + 4) return 4;
+      if (Math.abs(x - tx) <= 1 && Math.abs(z - tz) <= 1 && y >= h + 5 && y <= h + 7) return 5;
+    }
+    return 0;
+  }
+
+  private naturalWithCache(x: number, y: number, z: number, biome: Biome, h: number): BlockId {
+    const terrain = this.terrainWithCache(x, y, z, biome, h);
+    if (terrain) return terrain;
+    if (y <= WATER_LEVEL) return 7;
+    return this.treeBlock(x, y, z);
+  }
+  private naturalBlock(x: number, y: number, z: number): BlockId {
+    const biome = biomeAt(x, z, this.seed);
+    return this.naturalWithCache(x, y, z, biome, terrainHeight(x, z, this.seed, biome));
+  }
+
+  get(x: number, y: number, z: number): BlockId {
+    if (y < 0 || y >= WORLD_HEIGHT) return y < 0 ? 3 : 0;
+    return this.edits.get(this.editKey(x, y, z)) ?? this.naturalBlock(x, y, z);
+  }
+
+  set(x: number, y: number, z: number, id: BlockId) {
+    if (y < 0 || y >= WORLD_HEIGHT) return;
+    const key = this.editKey(x, y, z);
+    if (id === this.naturalBlock(x, y, z)) this.edits.delete(key); else this.edits.set(key, id);
+    this.rebuildAround(x, z);
+    this.save();
+  }
+
+  // 설정 패널에서 호출; 8~24 범위는 마인크래프트 자체 렌더 거리 슬라이더와 동일
+  setRenderDistance(radius: number) {
+    this.visibleRadius = Math.max(8, Math.min(24, Math.round(radius)));
+  }
+
+  update(centerX: number, centerZ: number) {
+    const cx = Math.floor(centerX / CHUNK), cz = Math.floor(centerZ / CHUNK);
+    const needed = new Set<string>();
+    const fresh: [number, number, number][] = [];
+    for (let z = cz - this.visibleRadius; z <= cz + this.visibleRadius; z++) for (let x = cx - this.visibleRadius; x <= cx + this.visibleRadius; x++) {
+      const key = this.chunkKey(x, z); needed.add(key);
+      if (!this.chunks.has(key) && !this.pending.has(key)) {
+        this.pending.add(key); fresh.push([Math.max(Math.abs(x - cx), Math.abs(z - cz)), x, z]);
+      }
+    }
+    // 플레이어와 가까운 청크부터 생성 큐에 넣어서, 눈에 보이는 곳부터 먼저 채워지게 함
+    fresh.sort((a, b) => a[0] - b[0]);
+    for (const [, x, z] of fresh) this.buildQueue.push([x, z]);
+    for (const [key, mesh] of this.chunks) if (!needed.has(key)) {
+      this.group.remove(mesh); mesh.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose(); }); this.chunks.delete(key);
+    }
+    // 한 프레임에 정해진 개수만 생성 — 이동/최초 스폰 시 프리징 방지의 핵심
+    let budget = this.chunksPerFrame;
+    while (budget-- > 0 && this.buildQueue.length) {
+      const [x, z] = this.buildQueue.shift()!;
+      const key = this.chunkKey(x, z); this.pending.delete(key);
+      if (needed.has(key) && !this.chunks.has(key)) this.buildChunk(x, z);
+    }
+  }
+
+  private buildChunk(cx: number, cz: number) {
+    // 1) 청크 전체(+1칸 여백)의 블록을 딱 한 번씩만 계산해서 배열에 채움
+    //    (기존에는 이웃 면 확인 때문에 블록 하나당 노이즈 계산이 최대 7번씩 중복 실행됐음)
+    const data = new Uint8Array(PAD * WORLD_HEIGHT * PAD);
+    const idx = (lx: number, y: number, lz: number) => (lz * WORLD_HEIGHT + y) * PAD + lx;
+    const height = new Int16Array(PAD * PAD);
+    const biomeIdx = new Uint8Array(PAD * PAD);
+    for (let lz = 0; lz < PAD; lz++) for (let lx = 0; lx < PAD; lx++) {
+      const wx = cx * CHUNK - 1 + lx, wz = cz * CHUNK - 1 + lz;
+      const biome = biomeAt(wx, wz, this.seed);
+      height[lz * PAD + lx] = terrainHeight(wx, wz, this.seed, biome);
+      biomeIdx[lz * PAD + lx] = BIOMES.indexOf(biome);
+    }
+    for (let lz = 0; lz < PAD; lz++) for (let lx = 0; lx < PAD; lx++) {
+      const wx = cx * CHUNK - 1 + lx, wz = cz * CHUNK - 1 + lz;
+      const biome = BIOMES[biomeIdx[lz * PAD + lx]], h = height[lz * PAD + lx];
+      for (let y = 0; y < WORLD_HEIGHT; y++) {
+        const id = this.edits.get(this.editKey(wx, y, wz)) ?? this.naturalWithCache(wx, y, wz, biome, h);
+        data[idx(lx, y, lz)] = id;
+      }
+    }
+    // 2) 채워진 배열만 보고 보이는 면을 뽑아 메시 생성 (추가 노이즈 계산 없음)
+    const byType = new Map<BlockId, number[]>();
+    for (let lz = 1; lz <= CHUNK; lz++) for (let lx = 1; lx <= CHUNK; lx++) for (let y = 0; y < WORLD_HEIGHT; y++) {
+      const id = data[idx(lx, y, lz)] as BlockId;
+      if (!id) continue;
+      const wx = cx * CHUNK + (lx - 1), wz = cz * CHUNK + (lz - 1);
+      for (let f = 0; f < 6; f++) {
+        const [ox, oy, oz] = NEIGHBORS[f];
+        const ny = y + oy;
+        const neighbor = ny < 0 ? 3 : ny >= WORLD_HEIGHT ? 0 : data[idx(lx + ox, ny, lz + oz)];
+        if (neighbor) continue;
+        const list = byType.get(id) ?? []; byType.set(id, list);
+        const q = FACES[f];
+        const corner = (v: number) => [q[v * 3] + wx, q[v * 3 + 1] + y, q[v * 3 + 2] + wz];
+        const [p0, p1, p2, p3] = [corner(0), corner(1), corner(2), corner(3)];
+        list.push(...p0, ...p1, ...p2, ...p0, ...p2, ...p3);
+      }
+    }
+    const holder = new THREE.Group();
+    for (const [id, vertices] of byType) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+      geo.computeVertexNormals();
+      holder.add(new THREE.Mesh(geo, this.materials.get(id)!));
+    }
+    holder.userData.chunk = [cx, cz];
+    this.chunks.set(this.chunkKey(cx, cz), holder);
+    this.group.add(holder);
+  }
+
+  private rebuildAround(x: number, z: number) {
+    const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK);
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const key = this.chunkKey(cx + dx, cz + dz), old = this.chunks.get(key);
+      if (old) {
+        this.group.remove(old); old.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose(); });
+        this.chunks.delete(key); this.buildChunk(cx + dx, cz + dz);
+      }
+    }
+  }
+
+  raycast(origin: THREE.Vector3, direction: THREE.Vector3, max = 7): Hit | null {
+    const step = .08, p = origin.clone();
+    let px = Math.floor(p.x), py = Math.floor(p.y), pz = Math.floor(p.z);
+    for (let t = 0; t < max; t += step) {
+      p.addScaledVector(direction, step);
+      const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z);
+      if (x !== px || y !== py || z !== pz) {
+        if (this.get(x, y, z)) return { x, y, z, nx: px - x, ny: py - y, nz: pz - z };
+        px = x; py = y; pz = z;
+      }
+    }
+    return null;
+  }
+
+  private save() {
+    localStorage.setItem('meadow-voxels-edits', JSON.stringify([...this.edits]));
+    localStorage.setItem('meadow-voxels-seed', String(this.seed));
+  }
+  private load() {
+    try { for (const [key, value] of JSON.parse(localStorage.getItem('meadow-voxels-edits') ?? '[]')) this.edits.set(key, value); }
+    catch { localStorage.removeItem('meadow-voxels-edits'); }
+  }
+}
