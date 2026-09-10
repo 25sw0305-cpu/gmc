@@ -50,6 +50,7 @@ export function buildAtlas(): THREE.CanvasTexture {
   paint(ctx, 13, '#4a6b68', '#5be3d6', 'sparkle');  // diamond ore
   paint(ctx, 14, '#3d92d5', '#6fb6ea', 'ripple');   // water
   const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace; // 캔버스로 그린 색을 조명 계산에서 올바르게 해석하도록 지정
   texture.magFilter = THREE.NearestFilter; texture.minFilter = THREE.NearestFilter; // 확대해도 또렷한 픽셀아트 느낌
   texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
   cached = texture;

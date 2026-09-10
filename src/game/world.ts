@@ -46,7 +46,7 @@ export class VoxelWorld {
     const atlas = buildAtlas();
     for (const block of Object.values(BLOCKS)) if (block.id) this.materials.set(block.id, new THREE.MeshLambertMaterial({
       map: atlas, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .75 : 1,
-      side: block.id === 7 ? THREE.DoubleSide : THREE.FrontSide
+      depthWrite: block.id !== 7, side: block.id === 7 ? THREE.DoubleSide : THREE.FrontSide
     }));
     this.load();
     localStorage.setItem('meadow-voxels-seed', String(this.seed));
@@ -262,7 +262,10 @@ export class VoxelWorld {
         const [ox, oy, oz] = NEIGHBORS[f];
         const ny = y + oy;
         const neighbor = ny < 0 ? 3 : ny >= WORLD_HEIGHT ? 0 : data[idx(lx + ox, ny, lz + oz)];
-        if (neighbor) continue;
+        // 물은 반투명이라 완전히 가려주지 못함: 물이 아닌 블록은 이웃이 물이어도 면을 그려야
+        // 물속 바닥/벽면이 사라져 뒤쪽 블록이 비쳐 보이는 문제가 생기지 않는다.
+        const occluded = id === 7 ? neighbor !== 0 : (neighbor !== 0 && neighbor !== 7);
+        if (occluded) continue;
         const entry = byType.get(id) ?? { pos: [], uv: [] }; byType.set(id, entry);
         const q = FACES[f];
         const corner = (v: number) => [q[v * 3] + wx, q[v * 3 + 1] + y, q[v * 3 + 2] + wz];
