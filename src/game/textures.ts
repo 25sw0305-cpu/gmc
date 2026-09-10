@@ -23,7 +23,7 @@ function paint(ctx: CanvasRenderingContext2D, i: number, base: string, accent: s
     else if (pattern === 'ring') { const d = Math.hypot(px - 7.5, py - 7.5); on = Math.abs((d % 3.4) - 1.6) < .55; }
     else if (pattern === 'sparkle') on = n > .93;
     else if (pattern === 'ripple') on = Math.abs(((px + py) % 6) - 3) < 1 && n > .3;
-    else if (pattern === 'tuft') on = py < 3 && n > .35;
+    else if (pattern === 'tuft') { const h = 2 + Math.floor(rand(i * 13.7 + px * 29.3) * 4); on = py < h; }
     if (on) ctx.fillRect(x0 + px, y0 + py, 1, 1);
   }
 }
