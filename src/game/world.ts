@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import { BLOCKS, CHUNK, type BlockId, WORLD_HEIGHT } from './blocks';
 import { biomeAt, noise2, noise3, terrainHeight, type Biome } from './noise';
-import { buildAtlas, tileForFace, tileUV } from './textures';
 
 const WATER_LEVEL = 15;
 const PAD = CHUNK + 2; // 청크 생성 시 이웃 블록 확인용 1칸 여백
@@ -15,13 +14,6 @@ const FACES: Face[] = [
   [0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0], [0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]
 ];
 const NEIGHBORS: [number, number, number][] = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]];
-
-// face 정점의 지역좌표를 텍스처 (u,v)로 매핑: 옆면은 항상 v=y(높이), 위/아래는 u=x,v=z
-function faceUV(face: number, lx: number, ly: number, lz: number): [number, number] {
-  if (face === 2 || face === 3) return [lx, lz];
-  if (face === 0 || face === 1) return [lz, ly];
-  return [lx, ly];
-}
 
 export interface Hit { x: number; y: number; z: number; nx: number; ny: number; nz: number; }
 
@@ -43,9 +35,8 @@ export class VoxelWorld {
   constructor(seed = Math.floor(Math.random() * 1e9)) {
     this.seed = seed;
     this.group.name = 'voxel-world';
-    const atlas = buildAtlas();
     for (const block of Object.values(BLOCKS)) if (block.id) this.materials.set(block.id, new THREE.MeshLambertMaterial({
-      map: atlas, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .75 : 1,
+      color: block.color, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .75 : 1,
       depthWrite: block.id !== 7, side: block.id === 7 ? THREE.DoubleSide : THREE.FrontSide
     }));
     this.load();
@@ -252,8 +243,8 @@ export class VoxelWorld {
         data[idx(lx, y, lz)] = id;
       }
     }
-    // 2) 채워진 배열만 보고 보이는 면을 뽑아 메시 생성 (추가 노이즈 계산 없음), 텍스처 UV도 함께 기록
-    const byType = new Map<BlockId, { pos: number[]; uv: number[] }>();
+    // 2) 채워진 배열만 보고 보이는 면을 뽑아 메시 생성 (추가 노이즈 계산 없음)
+    const byType = new Map<BlockId, number[]>();
     for (let lz = 1; lz <= CHUNK; lz++) for (let lx = 1; lx <= CHUNK; lx++) for (let y = 0; y < WORLD_HEIGHT; y++) {
       const id = data[idx(lx, y, lz)] as BlockId;
       if (!id) continue;
@@ -266,25 +257,17 @@ export class VoxelWorld {
         // 물속 바닥/벽면이 사라져 뒤쪽 블록이 비쳐 보이는 문제가 생기지 않는다.
         const occluded = id === 7 ? neighbor !== 0 : (neighbor !== 0 && neighbor !== 7);
         if (occluded) continue;
-        const entry = byType.get(id) ?? { pos: [], uv: [] }; byType.set(id, entry);
+        const list = byType.get(id) ?? []; byType.set(id, list);
         const q = FACES[f];
         const corner = (v: number) => [q[v * 3] + wx, q[v * 3 + 1] + y, q[v * 3 + 2] + wz];
         const [p0, p1, p2, p3] = [corner(0), corner(1), corner(2), corner(3)];
-        entry.pos.push(...p0, ...p1, ...p2, ...p0, ...p2, ...p3);
-        const [tu0, tv0, tu1, tv1] = tileUV(tileForFace(id, f));
-        const uvAt = (v: number) => {
-          const [lu, lv] = faceUV(f, q[v * 3], q[v * 3 + 1], q[v * 3 + 2]);
-          return [tu0 + lu * (tu1 - tu0), tv0 + lv * (tv1 - tv0)];
-        };
-        const [a, b, c, d] = [uvAt(0), uvAt(1), uvAt(2), uvAt(3)];
-        entry.uv.push(...a, ...b, ...c, ...a, ...c, ...d);
+        list.push(...p0, ...p1, ...p2, ...p0, ...p2, ...p3);
       }
     }
     const holder = new THREE.Group();
-    for (const [id, { pos, uv }] of byType) {
+    for (const [id, vertices] of byType) {
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
       geo.computeVertexNormals();
       holder.add(new THREE.Mesh(geo, this.materials.get(id)!));
     }
