@@ -1,10 +1,12 @@
 import * as THREE from 'three';
 import { BLOCKS, CHUNK, type BlockId, WORLD_HEIGHT } from './blocks';
 import { biomeAt, noise2, noise3, terrainHeight, type Biome } from './noise';
+import { buildAtlas, tileForFace, tileUV } from './textures';
 
 const WATER_LEVEL = 15;
 const PAD = CHUNK + 2; // 청크 생성 시 이웃 블록 확인용 1칸 여백
 const BIOMES: Biome[] = ['plains', 'forest', 'desert', 'mountain'];
+const MAX_WATER_SPREAD = 7; // 마인크래프트처럼 수원지에서 가로로 최대 7칸까지만 흐름
 
 type Face = number[];
 const FACES: Face[] = [
@@ -13,6 +15,13 @@ const FACES: Face[] = [
   [0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0], [0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]
 ];
 const NEIGHBORS: [number, number, number][] = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]];
+
+// face 정점의 지역좌표를 텍스처 (u,v)로 매핑: 옆면은 항상 v=y(높이), 위/아래는 u=x,v=z
+function faceUV(face: number, lx: number, ly: number, lz: number): [number, number] {
+  if (face === 2 || face === 3) return [lx, lz];
+  if (face === 0 || face === 1) return [lz, ly];
+  return [lx, ly];
+}
 
 export interface Hit { x: number; y: number; z: number; nx: number; ny: number; nz: number; }
 
@@ -26,12 +35,17 @@ export class VoxelWorld {
   private materials = new Map<BlockId, THREE.MeshLambertMaterial>();
   private buildQueue: [number, number][] = [];
   private pending = new Set<string>();
+  // --- 물/모래 물리 ---
+  private dirty = new Set<string>();       // 다음 tick에 검사할 좌표
+  private waterFlow = new Map<string, number>(); // 수원지에서부터의 가로 확산 거리
+  private meshDirty = new Set<string>();   // 이번 물리 tick에서 다시 그려야 할 청크
 
   constructor(seed = Math.floor(Math.random() * 1e9)) {
     this.seed = seed;
     this.group.name = 'voxel-world';
+    const atlas = buildAtlas();
     for (const block of Object.values(BLOCKS)) if (block.id) this.materials.set(block.id, new THREE.MeshLambertMaterial({
-      color: block.color, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .68 : 1,
+      map: atlas, flatShading: true, transparent: block.id === 7, opacity: block.id === 7 ? .75 : 1,
       side: block.id === 7 ? THREE.DoubleSide : THREE.FrontSide
     }));
     this.load();
@@ -110,12 +124,81 @@ export class VoxelWorld {
     return this.edits.get(this.editKey(x, y, z)) ?? this.naturalBlock(x, y, z);
   }
 
-  set(x: number, y: number, z: number, id: BlockId) {
-    if (y < 0 || y >= WORLD_HEIGHT) return;
+  // edits만 갱신하고 메시는 아직 다시 그리지 않음 (여러 블록이 한꺼번에 바뀔 때 청크 재생성을 한 번으로 묶기 위함)
+  private applyEdit(x: number, y: number, z: number, id: BlockId) {
     const key = this.editKey(x, y, z);
     if (id === this.naturalBlock(x, y, z)) this.edits.delete(key); else this.edits.set(key, id);
-    this.rebuildAround(x, z);
+    if (id !== 7) this.waterFlow.delete(key);
+    const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK);
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) this.meshDirty.add(this.chunkKey(cx + dx, cz + dz));
+  }
+  private flushMesh() {
+    for (const key of this.meshDirty) {
+      const old = this.chunks.get(key);
+      if (!old) continue; // 아직 로드 안 된 청크는 나중에 생성될 때 edits를 반영해서 만들어짐
+      const [cx, cz] = key.split(',').map(Number);
+      this.group.remove(old); old.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose(); });
+      this.chunks.delete(key); this.buildChunk(cx, cz);
+    }
+    this.meshDirty.clear();
+  }
+  // 물/모래가 반응해야 할 좌표들을 다음 물리 tick 대상으로 표시
+  private wake(x: number, y: number, z: number) {
+    this.dirty.add(this.editKey(x, y, z));
+    for (const [dx, dy, dz] of NEIGHBORS) this.dirty.add(this.editKey(x + dx, y + dy, z + dz));
+  }
+
+  set(x: number, y: number, z: number, id: BlockId) {
+    if (y < 0 || y >= WORLD_HEIGHT) return;
+    this.applyEdit(x, y, z, id);
+    this.flushMesh();
+    this.wake(x, y, z);
     this.save();
+  }
+
+  // 모래는 아래가 비어 있으면 한 칸씩 떨어짐 (여러 tick에 걸쳐 바닥까지 낙하)
+  private tickFalling(x: number, y: number, z: number, id: BlockId) {
+    if (y <= 0) return;
+    const below = this.get(x, y - 1, z);
+    if (below !== 0 && below !== 7) return;
+    this.applyEdit(x, y, z, below === 7 ? 7 : 0);
+    this.applyEdit(x, y - 1, z, id);
+    this.wake(x, y - 1, z);
+    this.dirty.add(this.editKey(x, y + 1, z)); // 위에 다른 모래가 쌓여있었다면 그것도 이어서 검사
+  }
+
+  // 물은 아래로 먼저 떨어지고, 더 떨어질 곳이 없으면 수원지에서 최대 7칸까지 옆으로 퍼짐
+  private tickWater(x: number, y: number, z: number) {
+    const below = this.get(x, y - 1, z);
+    if (y > 0 && below === 0) {
+      this.applyEdit(x, y - 1, z, 7);
+      this.waterFlow.set(this.editKey(x, y - 1, z), 0);
+      this.wake(x, y - 1, z);
+      return;
+    }
+    const depth = this.waterFlow.get(this.editKey(x, y, z)) ?? 0;
+    if (depth >= MAX_WATER_SPREAD) return;
+    for (const [dx, , dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] as const) {
+      const nx = x + dx, nz = z + dz;
+      if (this.get(nx, y, nz) !== 0) continue;
+      this.applyEdit(nx, y, nz, 7);
+      this.waterFlow.set(this.editKey(nx, y, nz), depth + 1);
+      this.wake(nx, y, nz);
+    }
+  }
+
+  // main.ts에서 일정 간격(약 0.15초)마다 호출. 매 프레임 전체 월드를 검사하지 않고,
+  // 실제로 변화가 생긴 좌표(dirty)만 검사해서 성능을 지킴.
+  tickPhysics() {
+    if (!this.dirty.size) return;
+    const batch = [...this.dirty]; this.dirty.clear();
+    for (const key of batch) {
+      const [x, y, z] = key.split(',').map(Number);
+      const id = this.get(x, y, z);
+      if (id === 6) this.tickFalling(x, y, z, id);
+      else if (id === 7) this.tickWater(x, y, z);
+    }
+    this.flushMesh();
   }
 
   // 설정 패널에서 호출; 8~24 범위는 마인크래프트 자체 렌더 거리 슬라이더와 동일
@@ -169,8 +252,8 @@ export class VoxelWorld {
         data[idx(lx, y, lz)] = id;
       }
     }
-    // 2) 채워진 배열만 보고 보이는 면을 뽑아 메시 생성 (추가 노이즈 계산 없음)
-    const byType = new Map<BlockId, number[]>();
+    // 2) 채워진 배열만 보고 보이는 면을 뽑아 메시 생성 (추가 노이즈 계산 없음), 텍스처 UV도 함께 기록
+    const byType = new Map<BlockId, { pos: number[]; uv: number[] }>();
     for (let lz = 1; lz <= CHUNK; lz++) for (let lx = 1; lx <= CHUNK; lx++) for (let y = 0; y < WORLD_HEIGHT; y++) {
       const id = data[idx(lx, y, lz)] as BlockId;
       if (!id) continue;
@@ -180,34 +263,31 @@ export class VoxelWorld {
         const ny = y + oy;
         const neighbor = ny < 0 ? 3 : ny >= WORLD_HEIGHT ? 0 : data[idx(lx + ox, ny, lz + oz)];
         if (neighbor) continue;
-        const list = byType.get(id) ?? []; byType.set(id, list);
+        const entry = byType.get(id) ?? { pos: [], uv: [] }; byType.set(id, entry);
         const q = FACES[f];
         const corner = (v: number) => [q[v * 3] + wx, q[v * 3 + 1] + y, q[v * 3 + 2] + wz];
         const [p0, p1, p2, p3] = [corner(0), corner(1), corner(2), corner(3)];
-        list.push(...p0, ...p1, ...p2, ...p0, ...p2, ...p3);
+        entry.pos.push(...p0, ...p1, ...p2, ...p0, ...p2, ...p3);
+        const [tu0, tv0, tu1, tv1] = tileUV(tileForFace(id, f));
+        const uvAt = (v: number) => {
+          const [lu, lv] = faceUV(f, q[v * 3], q[v * 3 + 1], q[v * 3 + 2]);
+          return [tu0 + lu * (tu1 - tu0), tv0 + lv * (tv1 - tv0)];
+        };
+        const [a, b, c, d] = [uvAt(0), uvAt(1), uvAt(2), uvAt(3)];
+        entry.uv.push(...a, ...b, ...c, ...a, ...c, ...d);
       }
     }
     const holder = new THREE.Group();
-    for (const [id, vertices] of byType) {
+    for (const [id, { pos, uv }] of byType) {
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
       geo.computeVertexNormals();
       holder.add(new THREE.Mesh(geo, this.materials.get(id)!));
     }
     holder.userData.chunk = [cx, cz];
     this.chunks.set(this.chunkKey(cx, cz), holder);
     this.group.add(holder);
-  }
-
-  private rebuildAround(x: number, z: number) {
-    const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK);
-    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
-      const key = this.chunkKey(cx + dx, cz + dz), old = this.chunks.get(key);
-      if (old) {
-        this.group.remove(old); old.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose(); });
-        this.chunks.delete(key); this.buildChunk(cx + dx, cz + dz);
-      }
-    }
   }
 
   raycast(origin: THREE.Vector3, direction: THREE.Vector3, max = 7): Hit | null {

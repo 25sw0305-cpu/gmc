@@ -21,3 +21,9 @@ export const BLOCKS: Record<BlockId, BlockDef> = {
 };
 // 숫자키 1~9에 대응 (광석은 채굴로 얻는 자원이라 hotbar에는 대표로 석탄만 배치)
 export const HOTBAR: BlockId[] = [1, 2, 3, 4, 5, 6, 13, 8, 7];
+
+// 마인크래프트의 "맨손 채굴" 소요 시간(초)과 동일한 값. 광석류는 전부 hardness=3 → 15초로 통일되어 있음.
+const HARDNESS: Partial<Record<BlockId, number>> = {
+  1: .9, 2: .75, 3: 7.5, 4: 3, 5: .3, 6: .75, 8: 15, 9: 15, 10: 15, 11: 15, 12: .3, 13: 1.2
+};
+export function breakSeconds(id: BlockId): number { return HARDNESS[id] ?? .75; }
